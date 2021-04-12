@@ -1,0 +1,11 @@
+prereqs:
+  runtime:
+    requires:
+      CPAN::Meta::Requirements:
+      CPAN::Meta:
+      File::pushd:
+      HTTP::Tiny:
+      IO::Socket::SSL:
+      IPC::Run3:
+      JSON::PP:
+      version:

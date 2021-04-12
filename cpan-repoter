@@ -1,0 +1,541 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+use CPAN::Meta::Requirements;
+use CPAN::Meta;
+use Config;
+use File::Basename ();
+use File::Path ();
+use File::Temp ();
+use File::pushd ();
+use Getopt::Long ();
+use HTTP::Tiny;
+use IO::Socket::SSL;
+use IPC::Run3 ();
+use JSON::PP ();
+use version ();
+
+sub new {
+    my $class = shift;
+    bless { http => HTTP::Tiny->new }, $class;
+}
+
+sub show_help {
+    my $self = shift;
+    print <<'HELP';
+
+Usage: cpan-repoter [options] Package [version]
+
+Options:
+  -q, --quiet  be quiet
+  -h, --help   show this help
+      --perl   specify perl command
+      --cpanm  specify cpanm command
+      --make   specify make command
+      --work   specify working directory
+
+Examples:
+ > cpan-repoter App::cpm
+ > cpan-repoter App::cpm '== 0.900'
+ > cpan-repoter --perl ~/perls/5.8.1/bin/perl App::cpm
+
+HELP
+}
+
+sub parse_options {
+    my ($self, @argv) = @_;
+    local @ARGV = @argv;
+    Getopt::Long::GetOptions
+        "perl=s" => \(my $perl = $^X),
+        "cpanm=s" => \(my $cpanm = "cpanm"),
+        "make=s" => \(my $make = $Config{make}),
+        "work=s" => \(my $work = "."),
+        "q|quiet" => \my $quiet,
+        "h|help" => sub { $self->show_help; exit 1 },
+    or exit 1;
+    $self->{perl} = $perl;
+    $self->{cpanm} = $cpanm;
+    $self->{make} = $make;
+    $self->{work_dir} = $work;
+    if (!-d $self->{work_dir}) {
+        File::Path::mkpath $self->{work_dir};
+    }
+    $self->{_quiet} = $quiet;
+    if (1 <= @ARGV && @ARGV <= 2) {
+        $self->{_argv} = \@ARGV;
+    } else {
+        die "Need argument, try `$0 --help`\n";
+    }
+    $self;
+}
+
+sub run {
+    my $self = shift;
+    my ($package, $version) = @{ $self->{_argv} };
+    my $res = $self->_run($package, $version);
+    print JSON::PP->new->pretty->canonical->indent_length(2)->space_before(0)->utf8->encode($res);
+}
+
+sub log {
+    my ($self, $line) = @_;
+    return if $self->{_quiet};
+    chomp $line;
+    warn $line, "\n";
+}
+
+sub logf {
+    my ($self, $format, @argv) = @_;
+    return if $self->{_quiet};
+    warn sprintf "$format\n", @argv;
+}
+
+sub _run {
+    my ($self, $package, $version) = @_;
+
+    my $guard1 = File::pushd::pushd $self->{work_dir};
+
+    my $download_url = $self->resolve($package, $version);
+    $self->log("Resolved $package -> $download_url");
+    my $tarball = $self->fetch($download_url);
+    $self->log("Fetched $tarball");
+    my $dir = $self->untar($tarball);
+    $self->log("Extracted $dir");
+
+    my $guard2 = File::pushd::pushd $dir;
+    my $RES = +{};
+
+    {
+        my $res = $self->envs;
+        $RES->{meta}{env} = $res;
+    }
+    {
+        my $res = $self->perl_V;
+        $RES->{meta}{perl_V} = $res;
+    }
+    {
+        my $res = $self->perl_info;
+        $RES->{meta} = +{ %{ $RES->{meta} }, %$res };
+    }
+    if (my $perl_req = $self->perl_req) {
+        my $req = CPAN::Meta::Requirements->new;
+        $req->add_string_requirement("CPAN_REPOTER_TEST", $perl_req);
+        if (!$req->accepts_module("CPAN_REPOTER_TEST", $RES->{meta}{version})) {
+            die "$package requires perl $perl_req, but you have $RES->{meta}{version}\n";
+        }
+    }
+    if (my @req = $self->configure_reqs) {
+        $self->logf("Found %d configure reqs", scalar @req);
+        my $res = $self->install_reqs(@req);
+        $RES->{install_configure_reqs} = $res;
+        return $RES if !$res->{ok};
+    }
+    {
+        $self->log("Configure dist");
+        my $res = $self->configure;
+        $RES->{step_configure} = $res;
+        return $RES if !$res->{ok};
+    }
+    if (my @req = $self->reqs) {
+        $self->logf("Found %d reqs", scalar @req);
+        my $res = $self->install_reqs(@req);
+        $RES->{install_reqs} = $res;
+        return $RES if !$res->{ok};
+    }
+    {
+        my @req = $self->all_reqs;
+        my $res = $self->available_reqs(@req);
+        $RES->{prereqs} = $res;
+    }
+    {
+        $self->log("Build dist");
+        my $res = $self->build;
+        $RES->{step_build} = $res;
+        return $RES if !$res->{ok};
+    }
+    {
+        $self->log("Test dist");
+        my $res = $self->test;
+        $RES->{step_test} = $res;
+        return $RES if !$res->{ok};
+    }
+    {
+        $self->log("Install dist");
+        my $res = $self->install;
+        $RES->{step_install} = $res;
+        return $RES if !$res->{ok};
+    }
+    return $RES;
+}
+
+sub resolve {
+    my ($self, $package, $version) = @_;
+    my $url = "https://fastapi.metacpan.org/v1/download_url/$package";
+    if ($version) {
+        $version =~ s/([^a-zA-Z0-9_\-.])/uc sprintf("%%%02x",ord($1))/eg;
+        $url .= "?version=$version";
+    }
+    my $res = $self->{http}->get($url);
+    if ($res->{success}) {
+        my $content = JSON::PP::decode_json $res->{content};
+        return $content->{download_url};
+    }
+    die "$res->{status} $res->{reason}, $url\n";
+}
+
+sub fetch {
+    my ($self, $url) = @_;
+    my $file = File::Basename::basename($url);
+    my $res = $self->{http}->mirror($url => $file);
+    if ($res->{success}) {
+        return $file;
+    }
+    die "$res->{status} $res->{reason}, $url\n";
+}
+
+sub untar {
+    my ($self, $tarball) = @_;
+    (my $dir = $tarball) =~ s/\.tar\.gz$//;
+    $dir .= "-" . time;
+    mkdir $dir or die "mkdir $dir: $!";
+    my @cmd = ("tar", "xf", $tarball, "--strip-components", 1, "-C", $dir);
+    my $out;
+    IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+    if ($? == 0) {
+        return $dir;
+    }
+    die "@cmd: $out";
+}
+
+{
+    package Req;
+    sub new {
+        my ($class, $package, $version) = @_;
+        bless { package => $package, version => $version }, $class;
+    }
+    sub cpanm_req {
+        my $self = shift;
+        if ($self->{version}) {
+            "$self->{package}~$self->{version}";
+        } else {
+            $self->{package};
+        }
+    }
+}
+
+sub install_reqs {
+    my ($self, @req) = @_;
+    @req = map { $_->cpanm_req } @req;
+    my @cmd = ("cpanm", "-nq", "--skip-satisfied", @req);
+    my $out;
+    IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+    +{
+        cmd => \@cmd,
+        out => $out,
+        exit => $?,
+        ok => $? == 0,
+    };
+}
+
+sub configure_reqs {
+    my $self = shift;
+    my $reqs = $self->meta->effective_prereqs->merged_requirements(['configure'], ['requires'])->as_string_hash;
+    my @req;
+    for my $package (grep { $_ ne "perl" } sort keys %$reqs) {
+        push @req, Req->new($package, $reqs->{$package});
+    }
+    @req;
+}
+
+sub reqs {
+    my $self = shift;
+    my $reqs = $self->mymeta->effective_prereqs->merged_requirements(['build', 'test', 'runtime'], ['requires'])->as_string_hash;
+    my @req;
+    for my $package (grep { $_ ne "perl" } sort keys %$reqs) {
+        push @req, Req->new($package, $reqs->{$package});
+    }
+    @req;
+}
+
+sub all_reqs {
+    my $self = shift;
+    my $reqs = $self->mymeta->effective_prereqs->merged_requirements(['configure', 'build', 'test', 'runtime'], ['requires'])->as_string_hash;
+    my @req;
+    for my $package (grep { $_ ne "perl" } sort keys %$reqs) {
+        push @req, Req->new($package, $reqs->{$package});
+    }
+    @req;
+}
+
+sub perl_req {
+    my $self = shift;
+    my $reqs = $self->meta->effective_prereqs->merged_requirements(['configure', 'build', 'test', 'runtime'], ['requires'])->as_string_hash;
+    $reqs->{perl} || 0;
+}
+
+sub meta {
+    my $self = shift;
+    $self->{_meta} ||= do {
+        my ($file) = grep -f, 'META.json', 'META.yml';
+        CPAN::Meta->load_file($file);
+    };
+}
+
+sub mymeta {
+    my $self = shift;
+    $self->{_mymeta} ||= do {
+        my ($file) = grep -f, 'MYMETA.json', 'MYMETA.yml';
+        CPAN::Meta->load_file($file);
+    };
+}
+
+sub configure {
+    my $self = shift;
+    my (@cmd, $out, $exit);
+    CONFIGURE: {
+        if (-f 'Build.PL') {
+            @cmd = ($self->{perl}, "Build.PL");
+            IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+            $exit = $?;
+            if ($exit == 0 && -f 'Build') {
+                $self->{builder} = 'MB';
+                last CONFIGURE;
+            }
+        }
+        if (-f 'Makefile.PL') {
+            @cmd = ($self->{perl}, 'Makefile.PL');
+            IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+            $exit = $?;
+            if ($exit == 0 && -f 'Makefile') {
+                $self->{builder} = 'EUMM';
+                last CONFIGURE;
+            }
+        }
+    }
+    return {
+        cmd => \@cmd,
+        out => $out,
+        exit => $exit,
+        ok => !!$self->{builder},
+    };
+}
+
+sub build {
+    my $self = shift;
+    my (@cmd, $out, $exit);
+    if ($self->{builder} eq 'MB') {
+        @cmd = ($self->{perl}, 'Build');
+        IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+        $exit = $?;
+    } else {
+        @cmd = ($self->{make});
+        IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+        $exit = $?;
+    }
+    return {
+        cmd => \@cmd,
+        out => $out,
+        exit => $exit,
+        ok => $exit == 0,
+    };
+}
+
+sub test {
+    my $self = shift;
+    my (@cmd, $out, $exit);
+    if ($self->{builder} eq 'MB') {
+        @cmd = ($self->{perl}, 'Build', 'test');
+        IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+        $exit = $?;
+    } else {
+        @cmd = ($self->{make}, 'test');
+        IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+        $exit = $?;
+    }
+    return {
+        cmd => \@cmd,
+        out => $out,
+        exit => $exit,
+        ok => $exit == 0,
+    };
+}
+
+sub install {
+    my $self = shift;
+    my (@cmd, $out, $exit);
+    if ($self->{builder} eq 'MB') {
+        @cmd = ($self->{perl}, 'Build', 'install');
+        IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+        $exit = $?;
+    } else {
+        @cmd = ($self->{make}, 'install');
+        IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+        $exit = $?;
+    }
+    return {
+        cmd => \@cmd,
+        out => $out,
+        exit => $exit,
+        ok => $exit == 0,
+    };
+}
+
+sub available_reqs {
+    my ($self, @req) = @_;
+    my @toolchain = qw(
+        CPAN::Meta
+        CPAN::Meta::YAML
+        Cwd
+        ExtUtils::CBuilder
+        ExtUtils::MakeMaker
+        ExtUtils::ParseXS
+        File::Spec
+        JSON::PP
+        Module::Build
+        Module::Build::Tiny
+        Test::Harness
+        Test::More
+        version
+    );
+    my $res = {
+        toolchains => {},
+        reqs => {},
+    };
+    for my $package (@toolchain) {
+        my $available = $self->_available_version($package);
+        $res->{toolchains}{$package} = { %$available };
+    }
+    for my $req (@req) {
+        my $available = $self->_available_version($req->{package});
+        $res->{reqs}{$req->{package}} = { %$available, want => $req->{version} || 0 };
+    }
+    $res;
+}
+
+my $_available_script_content = <<'SCRIPT';
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+my $package = shift;
+(my $file = $package) =~ s{::}{/}g;
+$file .= ".pm";
+
+eval { require $file } or exit 1;
+
+my $v = $package->VERSION || 0;
+my $inc = $INC{$file};
+
+print <<EOF;
+{
+    "have": "$v",
+    "path": "$inc"
+}
+EOF
+SCRIPT
+my $_available_script;
+
+
+sub _available_version {
+    my ($self, $package) = @_;
+    $_available_script ||= do {
+        my ($fh, $file) = File::Temp::tempfile(UNLINK => 1, EXLOCK => 0);
+        $fh->print($_available_script_content);
+        close $fh;
+        $file;
+    };
+    my @cmd = ($self->{perl}, $_available_script, $package);
+    my $out;
+    IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+    if ($? == 0) {
+        return JSON::PP::decode_json $out;
+    } else {
+        return "N/A";
+    }
+}
+
+sub envs {
+    my @name = qw(
+        /HARNESS/
+        /LC_/
+        /PERL/
+        /_TEST/
+        CCFLAGS
+        COMSPEC
+        INCLUDE
+        INSTALL_BASE
+        LANG
+        LANGUAGE
+        LD_LIBRARY_PATH
+        LDFLAGS
+        LIB
+        NON_INTERACTIVE
+        NUMBER_OF_PROCESSORS
+        PATH
+        PREFIX
+        PROCESSOR_IDENTIFIER
+        SHELL
+        TERM
+        TEMP
+        TMPDIR
+    );
+    my @key;
+    for my $name (@name) {
+        if (my ($regexp) = $name =~ m{/(.*)/}) {
+            push @key, grep { $_ =~ /$regexp/ } keys %ENV
+        } else {
+            push @key, grep { $_ eq $name } keys %ENV;
+        }
+    }
+    return +{ map { ($_, $ENV{$_}) } @key };
+}
+
+sub perl_V {
+    my $self = shift;
+    my @cmd = ($self->{perl}, "-V");
+    my $out;
+    IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+    return $out;
+}
+
+my $_perl_info_script_content = <<'SCRIPT';
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Config;
+
+print <<EOF;
+{
+    "os_name": "$Config{osname}",
+    "os_version": "$Config{osvers}",
+    "archname": "$Config{archname}",
+    "myarchname": "$Config{myarchname}",
+    "version": "$Config{version}",
+    "\$^X": "$^X",
+    "\$UID": "$<",
+    "\$EUID": "$>",
+    "\$GID": "$(",
+    "\$EGID": "$)"
+}
+EOF
+SCRIPT
+my $_perl_info_script;
+
+sub perl_info {
+    my $self = shift;
+    $_perl_info_script ||= do {
+        my ($fh, $file) = File::Temp::tempfile(UNLINK => 1, EXLOCK => 0);
+        $fh->print($_perl_info_script_content);
+        close $fh;
+        $file;
+    };
+    my @cmd = ($self->{perl}, $_perl_info_script);
+    my $out;
+    IPC::Run3::run3 \@cmd, undef, \$out, \$out;
+    if ($? != 0) {
+        die;
+    }
+    JSON::PP::decode_json $out;
+}
+
+__PACKAGE__->new->parse_options(@ARGV)->run;
