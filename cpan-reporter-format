@@ -1,0 +1,72 @@
+#!/usr/bin/env perl
+use 5.32.1;
+use warnings;
+use experimental 'signatures';
+use JSON::PP ();
+
+sub fillin ($template, $hash) {
+    $template =~ s/\{\{ \s* (\S+?) \s* \}\}/ $hash->{$1} or die "undefined var '$1'\n" /xger;
+}
+
+my $template = <<'EOF';
+This is a computer-generated report for {{ distvname }}
+on perl {{ perl_version }}, created by {{ created_by }}.
+
+Sections of this report:
+
+    * Program output
+    * perl -V
+    * Raw JSON output
+
+------------------------------
+PROGRAM OUTPUT
+------------------------------
+
+{{ program_output }}
+
+------------------------------
+PERL -V
+------------------------------
+
+{{ perl_V }}
+
+------------------------------
+RAW JSON OUTPUT
+------------------------------
+
+{{ json }}
+
+EOF
+
+my $file = shift or die "Usage: cpan-reporter-format result.json\n";
+my $json = do {
+    open my $fh, "<", $file or die "$!: $file";
+    local $/;
+    JSON::PP::decode_json <$fh>;
+};
+
+if (!$json->{grade}) {
+    die "no grade in $file\n";
+}
+
+my %data;
+for my $name (qw(step_test step_build step_configure step_prepare)) {
+    if (my $step = $json->{$name}) {
+        if ($step->{cmd}) {
+            $data{program_output} = sprintf "Output from '%s':\n\n%s",
+                (join " ", $step->{cmd}->@*), $step->{out};
+        } else {
+            $data{program_output} = $step->{out};
+        }
+        last;
+    }
+}
+
+$data{created_by} = $json->{created}{by};
+$data{perl_version} = $json->{meta}{version};
+$data{distvname} = $json->{target}{distvname};
+$data{perl_V} = $json->{meta}{perl_V};
+$data{json} = JSON::PP->new->pretty->canonical->indent_length(2)->space_before(0)->utf8->encode($json);
+chomp $_ for values %data;
+
+print fillin $template, { %data };
