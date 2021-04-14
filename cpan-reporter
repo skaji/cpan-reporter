@@ -358,7 +358,7 @@ sub all_reqs ($self) {
 
 sub perl_req ($self) {
     my $reqs = $self->meta->effective_prereqs->merged_requirements(['configure', 'build', 'test', 'runtime'], ['requires'])->as_string_hash;
-    $reqs->{perl} || 0;
+    $reqs->{perl} || "0";
 }
 
 sub meta ($self) {
@@ -477,7 +477,7 @@ sub available_reqs ($self, @req) {
     }
     for my $req (@req) {
         my $available = $self->_available_version($req->{package});
-        $res->{reqs}{$req->{package}} = { $available->%*, want => $req->{version} || 0 };
+        $res->{reqs}{$req->{package}} = { $available->%*, want => $req->{version} || "0" };
     }
     $res;
 }
@@ -493,7 +493,7 @@ $file .= ".pm";
 
 eval { require $file } or exit 1;
 
-my $v = $package->VERSION || 0;
+my $v = $package->VERSION || "0";
 my $inc = $INC{$file};
 
 print <<EOF;
