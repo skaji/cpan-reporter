@@ -18,24 +18,38 @@ use IO::Socket::SSL;
 use IPC::Run3 ();
 use JSON::PP ();
 use POSIX ();
-use YAML::PP ();
 use version ();
 
 our $VERSION = '0.001';
 
-sub run3 ($env, @cmd) {
-    local %ENV = $env->%* if $env;
+sub run3 ($self, @cmd) {
     my $out;
     IPC::Run3::run3 \@cmd, undef, \$out, \$out;
     ($?, $out);
 }
 
-sub tempfile ($self) {
-    File::Temp::tempfile "cpan-reporter-helper-XXXXX", UNLINK => 0, EXLOCK => 0, DIR => $self->{work_dir};
+sub run3_env ($self, @cmd) {
+    my $env = $self->_env;
+    local %ENV = $env->%* if $env;
+    $self->run3(@cmd);
+}
+
+sub tempfile ($self, $content) {
+    my ($fh, $file) = File::Temp::tempfile
+        TEMPLATE => "cpan-reporter-helper-XXXXX",
+        UNLINK => 0, EXLOCK => 0, DIR => $self->{work_dir},
+        PERMS => 0644,
+    ;
+    $fh->print($content);
+    close $fh;
+    $file;
 }
 
 sub new ($class) {
-    bless { http => HTTP::Tiny->new }, $class;
+    bless {
+        http => HTTP::Tiny->new,
+        json => JSON::PP->new->pretty->canonical->indent_length(2)->space_before(0)->utf8,
+    }, $class;
 }
 
 sub show_help ($self) {
@@ -93,7 +107,7 @@ sub parse_options ($self, @argv) {
     if (1 <= @argv && @argv <= 2) {
         $self->{_argv} = \@argv;
     } else {
-        die "Need argument, try `$0 --help`\n";
+        die "Need 1 or 2 arguments, try `$0 --help`\n";
     }
     $self;
 }
@@ -127,8 +141,7 @@ sub _env ($self) {
 sub run ($self) {
     my ($package, $version) = $self->{_argv}->@*;
     my $res = $self->_run($package, $version);
-    my $json = JSON::PP->new->pretty->canonical->indent_length(2)->space_before(0)->utf8;
-    $self->{out_fh}->print($json->encode($res));
+    $self->{out_fh}->print($self->{json}->encode($res));
 }
 
 sub log ($self, $line) {
@@ -261,7 +274,7 @@ sub resolve ($self, $package, $version) {
     }
     my $res = $self->{http}->get($url);
     if ($res->{success}) {
-        my $content = JSON::PP::decode_json $res->{content};
+        my $content = $self->{json}->decode($res->{content});
         return $content->{download_url};
     }
     die "$res->{status} $res->{reason}, $url\n";
@@ -280,7 +293,7 @@ sub untar ($self, $tarball) {
     my $dir = $tarball =~ s/\.tar\.gz$//r;
     $dir .= "-" . time;
     mkdir $dir or die "mkdir $dir: $!";
-    my ($exit, $out) = run3 undef, "tar", "xf", $tarball, "--strip-components", 1, "-C", $dir;
+    my ($exit, $out) = $self->run3("tar", "xf", $tarball, "--strip-components", 1, "-C", $dir);
     if ($exit != 0) {
         die $out;
     }
@@ -305,22 +318,20 @@ package Reqs {
         bless { reqs => \@req }, $class;
     }
     sub cpmfile ($self) {
-        my $content = <<~'EOF';
+        my $content = <<~'___';
         prereqs:
           runtime:
             requires:
-        EOF
+        ___
         $content .= "      " . $_->cpm_req . "\n" for $self->{reqs}->@*;
         $content;
     }
 }
 
 sub install_reqs ($self, @req) {
-    my ($fh, $cpmfile) = $self->tempfile;
-    $fh->print(Reqs->new(@req)->cpmfile);
-    close $fh;
+    my $cpmfile = $self->tempfile(Reqs->new(@req)->cpmfile);
     my @cmd = ($self->{perl}, $self->{cpm}, "install", "-L", $self->_extlib, "--cpmfile", $cpmfile);
-    my ($exit, $out) = run3 undef, @cmd;
+    my ($exit, $out) = $self->run3(@cmd);
     +{
         cmd => \@cmd,
         out => $out,
@@ -375,20 +386,36 @@ sub mymeta ($self) {
     };
 }
 
+sub _cmd ($self, $builder, $step) {
+    my %cmd = (
+        MB => {
+            configure => [$self->{perl}, 'Build.PL'],
+            build => [$self->{perl}, 'Build'],
+            test => [$self->{perl}, 'Build', 'test'],
+        },
+        EUMM => {
+            configure => [$self->{perl}, 'Makefile.PL'],
+            build => [$self->{make}],
+            test => [$self->{make}, 'test'],
+        },
+    );
+    $cmd{$builder}{$step}->@*;
+}
+
 sub configure ($self) {
     my (@cmd, $out, $exit);
     CONFIGURE: {
         if (-f 'Build.PL') {
-            @cmd = ($self->{perl}, "Build.PL");
-            ($exit, $out) = run3 $self->_env, @cmd;
+            @cmd = $self->_cmd('MB', 'configure');
+            ($exit, $out) = $self->run3_env(@cmd);
             if ($exit == 0 && -f 'Build') {
                 $self->{builder} = 'MB';
                 last CONFIGURE;
             }
         }
         if (-f 'Makefile.PL') {
-            @cmd = ($self->{perl}, 'Makefile.PL');
-            ($exit, $out) = run3 $self->_env, @cmd;
+            @cmd = $self->_cmd('EUMM', 'configure');
+            ($exit, $out) = $self->run3_env(@cmd);
             if ($exit == 0 && -f 'Makefile') {
                 $self->{builder} = 'EUMM';
                 last CONFIGURE;
@@ -404,13 +431,8 @@ sub configure ($self) {
 }
 
 sub build ($self) {
-    my @cmd;
-    if ($self->{builder} eq 'MB') {
-        @cmd = ($self->{perl}, 'Build');
-    } else {
-        @cmd = ($self->{make});
-    }
-    my ($exit, $out) = run3 $self->_env, @cmd;
+    my @cmd = $self->_cmd($self->{builder}, 'build');
+    my ($exit, $out) = $self->run3_env(@cmd);
     return {
         cmd => \@cmd,
         out => $out,
@@ -420,29 +442,8 @@ sub build ($self) {
 }
 
 sub test ($self) {
-    my @cmd;
-    if ($self->{builder} eq 'MB') {
-        @cmd = ($self->{perl}, 'Build', 'test');
-    } else {
-        @cmd = ($self->{make}, 'test');
-    }
-    my ($exit, $out) = run3 $self->_env, @cmd;
-    return {
-        cmd => \@cmd,
-        out => $out,
-        exit => $exit,
-        ok => $exit == 0,
-    };
-}
-
-sub install ($self) {
-    my @cmd;
-    if ($self->{builder} eq 'MB') {
-        @cmd = ($self->{perl}, 'Build', 'install');
-    } else {
-        @cmd = ($self->{make}, 'install');
-    }
-    my ($exit, $out) = run3 $self->_env, @cmd;
+    my @cmd = $self->_cmd($self->{builder}, 'test');
+    my ($exit, $out) = $self->run3_env(@cmd);
     return {
         cmd => \@cmd,
         out => $out,
@@ -482,38 +483,30 @@ sub available_reqs ($self, @req) {
     $res;
 }
 
-my $_available_script_content = <<'SCRIPT';
-#!/usr/bin/env perl
-use strict;
-use warnings;
-
-my $package = shift;
-(my $file = $package) =~ s{::}{/}g;
-$file .= ".pm";
-
-eval { require $file } or exit 1;
-
-my $v = $package->VERSION || "0";
-my $inc = $INC{$file};
-
-print <<EOF;
-{
-    "have": "$v",
-    "path": "$inc"
-}
-EOF
-SCRIPT
-
 sub _available_version ($self, $package) {
-    state $available_script = do {
-        my ($fh, $file) = $self->tempfile;
-        $fh->print($_available_script_content);
-        close $fh;
-        $file;
-    };
-    my ($exit, $out) = run3 $self->_env, $self->{perl}, $available_script, $package;
+    state $available_script = $self->tempfile(<<~'___');
+    use strict;
+    use warnings;
+
+    my $package = shift;
+    (my $file = $package) =~ s{::}{/}g;
+    $file .= ".pm";
+
+    eval { require $file } or exit 1;
+
+    my $v = $package->VERSION || "0";
+    my $inc = $INC{$file};
+
+    print qq[
+    {
+        "have": "$v",
+        "path": "$inc"
+    }
+    ]
+    ___
+    my ($exit, $out) = $self->run3_env($self->{perl}, $available_script, $package);
     if ($exit == 0) {
-        return JSON::PP::decode_json $out;
+        return $self->{json}->decode($out);
     } else {
         return { have => "na" };
     }
@@ -559,44 +552,40 @@ sub envs ($self) {
 }
 
 sub perl_V ($self) {
-    my ($exit, $out) = run3 $self->_env, $self->{perl}, "-V";
-    return $out;
-}
-
-my $_perl_info_script_content = <<'SCRIPT';
-#!/usr/bin/env perl
-use strict;
-use warnings;
-use Config;
-
-print <<EOF;
-{
-    "os_name": "$Config{osname}",
-    "os_version": "$Config{osvers}",
-    "archname": "$Config{archname}",
-    "myarchname": "$Config{myarchname}",
-    "version": "$Config{version}",
-    "\$^X": "$^X",
-    "\$UID": "$<",
-    "\$EUID": "$>",
-    "\$GID": "$(",
-    "\$EGID": "$)"
-}
-EOF
-SCRIPT
-
-sub perl_info ($self) {
-    state $perl_info_script = do {
-        my ($fh, $file) = $self->tempfile;
-        $fh->print($_perl_info_script_content);
-        close $fh;
-        $file;
-    };
-    my ($exit, $out) = run3 $self->_env, $self->{perl}, $perl_info_script;
+    my ($exit, $out) = $self->run3_env($self->{perl}, "-V");
     if ($exit != 0) {
         die $out;
     }
-    JSON::PP::decode_json $out;
+    return $out;
+}
+
+sub perl_info ($self) {
+    state $perl_info_script = $self->tempfile(<<~'___');
+    use strict;
+    use warnings;
+    use Config;
+
+    print qq[
+    {
+        "os_name": "$Config{osname}",
+        "os_version": "$Config{osvers}",
+        "archname": "$Config{archname}",
+        "myarchname": "$Config{myarchname}",
+        "version": "$Config{version}",
+        "\$^X": "$^X",
+        "\$UID": "$<",
+        "\$EUID": "$>",
+        "\$GID": "$(",
+        "\$EGID": "$)"
+    }
+    ];
+    ___
+
+    my ($exit, $out) = $self->run3_env($self->{perl}, $perl_info_script);
+    if ($exit != 0) {
+        die $out;
+    }
+    $self->{json}->decode($out);
 }
 
 __PACKAGE__->new->parse_options(@ARGV)->run if !caller;

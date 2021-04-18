@@ -1,0 +1,59 @@
+{
+  "comments": {},
+  "distribution": {
+    "name": "string",
+    "prerequisites": [
+      {
+        "have": "string",
+        "name": "string",
+        "need": "string",
+        "phase": "string"
+      }
+    ],
+    "version": "string"
+  },
+  "environment": {
+    "language": {
+      "archname": "string",
+      "build": "string",
+      "name": "Perl 5",
+      "variables": {},
+      "version": "string"
+    },
+    "system": {
+      "cpu_count": "string",
+      "cpu_description": "string",
+      "cpu_type": "string",
+      "filesystem": "string",
+      "hostname": "string",
+      "osname": "string",
+      "osversion": "string",
+      "variables": {}
+    },
+    "toolchain": {},
+    "user_agent": "string"
+  },
+  "reporter": {
+    "email": "string",
+    "name": "string"
+  },
+  "result": {
+    "duration": 0,
+    "failures": 0,
+    "grade": "pass",
+    "output": {
+      "build": "string",
+      "configure": "string",
+      "install": "string",
+      "test": "string",
+      "uncategorized": "string"
+    },
+    "skipped": 0,
+    "tests": 0,
+    "todo": {
+      "fail": 0,
+      "pass": 0
+    },
+    "warnings": 0
+  }
+}

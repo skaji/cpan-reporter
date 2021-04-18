@@ -9,6 +9,5 @@ prereqs:
       IO::Socket::SSL:
       IPC::Run3:
       JSON::PP:
-      YAML::PP:
       perl: { version: '5.32.1' }
       version:
